@@ -7,6 +7,7 @@ package db
 
 import (
 	"context"
+	_ "github.com/daeuniverse/dae-wing/component/xray"
 	"strings"
 
 	"github.com/daeuniverse/dae-wing/common"
