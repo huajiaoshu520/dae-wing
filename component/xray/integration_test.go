@@ -19,6 +19,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -46,13 +47,25 @@ func TestXrayEndToEnd(t *testing.T) {
 	if _, e := exec.LookPath("xray"); e != nil {
 		t.Skip("install pinned Xray to run integration tests")
 	}
-	for _, security := range []string{"none", "reality", "reality-encrypted"} {
+	for _, security := range []string{"none", "reality", "reality-encrypted", "reality-encrypted-vision", "reality-encrypted-vision-udp443"} {
 		t.Run(security, func(t *testing.T) {
 			server, key, encryption := startServer(t, security)
-			if security == "reality-encrypted" {
+			flow := ""
+			if strings.HasSuffix(security, "-vision") {
+				flow = "xtls-rprx-vision"
+			} else if strings.HasSuffix(security, "-vision-udp443") {
+				flow = "xtls-rprx-vision-udp443"
+			}
+			if strings.HasPrefix(security, "reality-encrypted") {
 				security = "reality"
 			}
 			q := url.Values{"type": {"xhttp"}, "security": {security}, "path": {"/test"}, "sni": {"localhost"}, "pbk": {key}, "mode": {"auto"}, "encryption": {encryption}}
+			if flow != "" {
+				q.Set("flow", flow)
+				q.Set("support-x25519mlkem768", "true")
+				q.Set("x_padding_bytes", "100-1000")
+				q.Set("extra", `{"mode":"auto","xPaddingBytes":"100-1000"}`)
+			}
 			link := "vless://" + testID + "@" + server + "?" + q.Encode()
 			recorder := &recordingDialer{}
 			raw, _, e := NewVLESS(&D.ExtraOption{}, recorder, link)
@@ -137,6 +150,15 @@ func TestXrayEndToEnd(t *testing.T) {
 			if !bytes.Equal(payload, b[:n]) || a != netip.MustParseAddrPort(udp.LocalAddr().String()) {
 				t.Fatal("UDP packet or source mismatch", n, a)
 			}
+			// Connected-style UDP writes must use the original destination too,
+			// rather than the unspecified UDP ASSOCIATE source address.
+			if _, e = conn.Write(payload); e != nil {
+				t.Fatal(e)
+			}
+			n, e = conn.Read(b)
+			if e != nil || !bytes.Equal(payload, b[:n]) {
+				t.Fatal("connected UDP mismatch", n, e)
+			}
 			conn.Close()
 			// A dead worker is reaped and recreated on the next request.
 			d.mu.Lock()
@@ -175,7 +197,11 @@ func startServer(t *testing.T, security string) (string, string, string) {
 	port := l.Addr().(*net.TCPAddr).Port
 	l.Close()
 	encryption, decryption := "none", "none"
-	if security == "reality-encrypted" {
+	flow := ""
+	if strings.HasSuffix(security, "-vision") || strings.HasSuffix(security, "-vision-udp443") {
+		flow = "xtls-rprx-vision"
+	}
+	if strings.HasPrefix(security, "reality-encrypted") {
 		security = "reality"
 		k, e := ecdh.X25519().GenerateKey(rand.Reader)
 		if e != nil {
@@ -195,7 +221,9 @@ func startServer(t *testing.T, security string) (string, string, string) {
 		target := tlsTarget(t)
 		stream["realitySettings"] = map[string]any{"dest": target, "serverNames": []string{"localhost"}, "privateKey": base64.RawURLEncoding.EncodeToString(k.Bytes()), "shortIds": []string{""}}
 	}
-	config := map[string]any{"log": map[string]any{"loglevel": "none"}, "inbounds": []any{map[string]any{"listen": "127.0.0.1", "port": port, "protocol": "vless", "settings": map[string]any{"decryption": decryption, "clients": []any{map[string]any{"id": testID}}}, "streamSettings": stream}}, "outbounds": []any{map[string]any{"protocol": "freedom"}}}
+	// New Xray releases block private targets by default. This isolated test
+	// server explicitly permits only the local echo targets.
+	config := map[string]any{"log": map[string]any{"loglevel": "none"}, "inbounds": []any{map[string]any{"listen": "127.0.0.1", "port": port, "protocol": "vless", "settings": map[string]any{"decryption": decryption, "clients": []any{map[string]any{"id": testID, "flow": flow}}}, "streamSettings": stream}}, "outbounds": []any{map[string]any{"protocol": "freedom", "settings": map[string]any{"finalRules": []any{map[string]any{"action": "allow", "ip": []string{"127.0.0.1/32"}}}}}}}
 	b, _ := json.Marshal(config)
 	cmd := exec.Command("xray", "run", "-config", "stdin:")
 	cmd.Stdin = bytes.NewReader(b)

@@ -7,6 +7,7 @@ import (
 
 	"github.com/daeuniverse/outbound/netproxy"
 	"github.com/daeuniverse/outbound/protocol/direct"
+	"github.com/daeuniverse/outbound/protocol/socks5"
 )
 
 // The SOCKS library's handshake has no context of its own. Bound every socket
@@ -41,4 +42,15 @@ func (h *localHop) finish() {
 	for _, c := range h.conns {
 		c.SetDeadline(time.Time{})
 	}
+}
+
+// Keep the packet destination separate from the UDP ASSOCIATE source address.
+// Embedding PktConn also preserves its packet and transport lifecycle methods.
+type localPacketConn struct {
+	*socks5.PktConn
+	target string
+}
+
+func (c *localPacketConn) Write(b []byte) (int, error) {
+	return c.PktConn.WriteTo(b, c.target)
 }
