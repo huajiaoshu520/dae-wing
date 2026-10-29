@@ -47,15 +47,27 @@ func parseNode(link string) (*nodeConfig, error) {
 	if err != nil || port < 1 || port > 65535 {
 		return nil, errors.New("invalid VLESS port")
 	}
-	if flow := q.Get("flow"); flow != "" && flow != "none" {
-		return nil, errors.New("XHTTP does not support a VLESS flow; clear the flow field")
-	}
 	encryption := q.Get("encryption")
 	if encryption == "" {
 		encryption = "none"
 	}
 	if encryption != "none" && !strings.HasPrefix(encryption, "mlkem768x25519plus.") {
 		return nil, errors.New("unsupported VLESS encryption")
+	}
+	flow := q.Get("flow")
+	if flow == "none" {
+		flow = ""
+	}
+	switch flow {
+	case "":
+	case "xtls-rprx-vision", "xtls-rprx-vision-udp443":
+		// VLESS Encryption supplies the connection Vision needs on XHTTP.
+		// Without it XHTTP does not expose the outer TLS/REALITY connection.
+		if encryption == "none" {
+			return nil, errors.New("XHTTP Vision requires VLESS encryption")
+		}
+	default:
+		return nil, errors.New("unsupported VLESS flow")
 	}
 	mode := q.Get("mode")
 	switch mode {
@@ -64,6 +76,7 @@ func parseNode(link string) (*nodeConfig, error) {
 		return nil, errors.New("unsupported XHTTP mode")
 	}
 	xhttp := map[string]any{"host": q.Get("host"), "path": q.Get("path"), "mode": mode}
+	extraSettings := make(map[string]json.RawMessage)
 	if extra := q.Get("extra"); extra != "" {
 		var v map[string]json.RawMessage
 		if json.Unmarshal([]byte(extra), &v) != nil || v == nil {
@@ -76,8 +89,21 @@ func parseNode(link string) (*nodeConfig, error) {
 				return nil, errors.New("XHTTP downloadSettings is not supported yet")
 			}
 		}
-		xhttp["extra"] = v
+		extraSettings = v
 	}
+	// Some clients export padding as a query parameter instead of XHTTP extra.
+	// Explicit extra settings take precedence when both representations exist.
+	if padding := q.Get("x_padding_bytes"); padding != "" {
+		if _, exists := extraSettings["xPaddingBytes"]; !exists {
+			value, _ := json.Marshal(padding)
+			extraSettings["xPaddingBytes"] = value
+		}
+	}
+	if len(extraSettings) > 0 {
+		xhttp["extra"] = extraSettings
+	}
+	// support-x25519mlkem768 is exporter metadata, not an Xray JSON setting.
+	// The pinned core and its uTLS fingerprint negotiate REALITY key shares.
 	security := q.Get("security")
 	if security == "" {
 		security = "none"
@@ -127,7 +153,7 @@ func parseNode(link string) (*nodeConfig, error) {
 		name = address
 	}
 	return &nodeConfig{name: name, address: address, outbound: map[string]any{
-		"tag": "proxy", "protocol": "vless", "settings": map[string]any{"vnext": []any{map[string]any{"address": u.Hostname(), "port": port, "users": []any{map[string]any{"id": u.User.Username(), "encryption": encryption}}}}}, "streamSettings": stream,
+		"tag": "proxy", "protocol": "vless", "settings": map[string]any{"vnext": []any{map[string]any{"address": u.Hostname(), "port": port, "users": []any{map[string]any{"id": u.User.Username(), "encryption": encryption, "flow": flow}}}}}, "streamSettings": stream,
 	}}, nil
 }
 

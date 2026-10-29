@@ -106,10 +106,24 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (netp
 	if err != nil {
 		return nil, err
 	}
-	conn, err := proxy.DialContext(ctx, local.Encode(), address)
+	associateAddress := address
+	if local.Network == "udp" {
+		// UDP ASSOCIATE describes the local sender, not the packet destination.
+		// New Xray versions enforce it; our UDP socket is allocated afterward.
+		associateAddress = "0.0.0.0:0"
+	}
+	conn, err := proxy.DialContext(ctx, local.Encode(), associateAddress)
 	hop.finish()
 	if err != nil {
 		return nil, err
+	}
+	if local.Network == "udp" {
+		packet, ok := conn.(*socks5.PktConn)
+		if !ok {
+			conn.Close()
+			return nil, errors.New("local SOCKS relay did not return a packet connection")
+		}
+		conn = &localPacketConn{PktConn: packet, target: address}
 	}
 	if err = ctx.Err(); err != nil {
 		conn.Close()
