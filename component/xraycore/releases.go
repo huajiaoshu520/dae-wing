@@ -59,6 +59,15 @@ func assetName() (string, error) {
 }
 
 func get(ctx context.Context, address string, limit int64) ([]byte, error) {
+	return getDownload(ctx, address, limit, false)
+}
+
+func getDownload(ctx context.Context, address string, limit int64, progress bool) ([]byte, error) {
+	if !progress {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 	if err != nil {
 		return nil, err
@@ -72,7 +81,11 @@ func get(ctx context.Context, address string, limit int64) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GitHub returned HTTP %d; check connectivity or rate limits", resp.StatusCode)
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	var reader io.Reader = resp.Body
+	if progress {
+		reader = &progressReader{ctx: ctx, reader: resp.Body, total: resp.ContentLength}
+	}
+	b, err := io.ReadAll(io.LimitReader(reader, limit+1))
 	if err == nil && int64(len(b)) > limit {
 		return nil, errors.New("Xray download exceeds size limit")
 	}
@@ -80,7 +93,7 @@ func get(ctx context.Context, address string, limit int64) ([]byte, error) {
 }
 
 func (m *Manager) Releases(ctx context.Context) ([]*Release, error) {
-	b, err := get(ctx, "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=30", 4<<20)
+	b, err := get(ctx, "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=30", 8<<20)
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +123,10 @@ func (m *Manager) Releases(ctx context.Context) ([]*Release, error) {
 func (m *Manager) Install(ctx context.Context, version string) (*Status, error) {
 	m.op.Lock()
 	defer m.op.Unlock()
+	return m.install(ctx, version)
+}
+
+func (m *Manager) install(ctx context.Context, version string) (*Status, error) {
 	if m.dir == "" {
 		return nil, errors.New("Xray manager has not been configured")
 	}
@@ -120,6 +137,7 @@ func (m *Manager) Install(ctx context.Context, version string) (*Status, error) 
 	if err != nil {
 		return nil, err
 	}
+	report(ctx, "metadata", 0, 0)
 	b, err := get(ctx, "https://api.github.com/repos/XTLS/Xray-core/releases/tags/"+version, 1<<20)
 	if err != nil {
 		return nil, err
@@ -149,14 +167,17 @@ func (m *Manager) Install(ctx context.Context, version string) (*Status, error) 
 	if !strings.HasPrefix(selected.Digest, "sha256:") || len(want) != 64 {
 		return nil, errors.New("official release is missing its SHA256 digest")
 	}
-	archive, err := get(ctx, selected.URL, 96<<20)
+	report(ctx, "downloading", 0, 0)
+	archive, err := getDownload(ctx, selected.URL, 96<<20, true)
 	if err != nil {
 		return nil, err
 	}
+	report(ctx, "verifying", 0, 0)
 	sum := sha256.Sum256(archive)
 	if !strings.EqualFold(hex.EncodeToString(sum[:]), want) {
 		return nil, errors.New("Xray archive SHA256 mismatch; current core was kept")
 	}
+	report(ctx, "extracting", 0, 0)
 	z, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
 	if err != nil {
 		return nil, err

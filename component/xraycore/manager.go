@@ -42,6 +42,8 @@ type Manager struct {
 	state     state
 	validate  func(context.Context, string) error
 	activated func()
+	taskMu    sync.RWMutex
+	task      Task
 }
 
 var Default = &Manager{}
@@ -57,6 +59,7 @@ func (m *Manager) Configure(configDir string) error {
 	if err := os.MkdirAll(m.dir, 0700); err != nil {
 		return err
 	}
+	defer m.restoreTask()
 	b, err := os.ReadFile(filepath.Join(m.dir, "selection.json"))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -133,6 +136,7 @@ func (m *Manager) Status(ctx context.Context) *Status {
 }
 
 func (m *Manager) activate(ctx context.Context, s Selection) (*Status, error) {
+	report(ctx, "validating", 0, 0)
 	path, err := m.resolve(s)
 	if err != nil {
 		return nil, err
@@ -145,6 +149,10 @@ func (m *Manager) activate(ctx context.Context, s Selection) (*Status, error) {
 			return nil, err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	report(ctx, "switching", 0, 0)
 	m.mu.RLock()
 	old := m.state.Current
 	m.mu.RUnlock()
@@ -191,6 +199,10 @@ func (m *Manager) save(s state) error {
 func (m *Manager) Select(ctx context.Context, mode, path string) (*Status, error) {
 	m.op.Lock()
 	defer m.op.Unlock()
+	return m.selectCore(ctx, mode, path)
+}
+
+func (m *Manager) selectCore(ctx context.Context, mode, path string) (*Status, error) {
 	if mode != "bundled" && mode != "system" {
 		return nil, errors.New("select bundled or system mode")
 	}
@@ -203,6 +215,10 @@ func (m *Manager) Select(ctx context.Context, mode, path string) (*Status, error
 func (m *Manager) Rollback(ctx context.Context) (*Status, error) {
 	m.op.Lock()
 	defer m.op.Unlock()
+	return m.rollback(ctx)
+}
+
+func (m *Manager) rollback(ctx context.Context) (*Status, error) {
 	m.mu.RLock()
 	previous := m.state.Previous
 	m.mu.RUnlock()

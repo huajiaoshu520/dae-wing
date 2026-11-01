@@ -15,6 +15,8 @@ func TestXrayCoreSchema(t *testing.T) {
 	// the release-list query and the rollback mutation.
 	for _, query := range []string{
 		`{ xrayCore { mode path version error canRollback } }`,
+		`{ xrayTask { id status phase downloadedBytes totalBytes error } }`,
+		`mutation { startXrayTask(kind:"install", version:"v26.10.31", path:"") { id status } }`,
 		`{ xrayReleases { version prerelease } }`,
 		`mutation { selectXrayCore(mode:"system", path:"/not/executed") { mode } }`,
 		`mutation { installXrayCore(version:"v26.10.31") { mode } }`,
@@ -27,6 +29,10 @@ func TestXrayCoreSchema(t *testing.T) {
 	}
 	ctx := context.WithValue(context.Background(), "role", "ADMIN")
 	response := schema.Exec(ctx, `{ xrayCore { mode path version error canRollback } }`, "", nil)
+	if len(response.Errors) > 0 {
+		t.Fatal(response.Errors)
+	}
+	response = schema.Exec(ctx, `{ xrayTask { id status kind version phase downloadedBytes totalBytes error } }`, "", nil)
 	if len(response.Errors) > 0 {
 		t.Fatal(response.Errors)
 	}

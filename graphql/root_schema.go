@@ -44,6 +44,17 @@ type Query {
 	general: General! @hasRole(role: ADMIN)
 	xrayCore: XrayCore! @hasRole(role: ADMIN)
 	xrayReleases: [XrayRelease!]! @hasRole(role: ADMIN)
+	xrayTask: XrayTask! @hasRole(role: ADMIN)
+}
+type XrayTask {
+	id: String!
+	status: String!
+	kind: String!
+	version: String!
+	phase: String!
+	downloadedBytes: Int!
+	totalBytes: Int!
+	error: String!
 }
 type XrayCore {
 	mode: String!
@@ -57,6 +68,7 @@ type XrayRelease {
 	prerelease: Boolean!
 }
 type Mutation {
+	startXrayTask(kind: String!, version: String!, path: String!): XrayTask! @hasRole(role: ADMIN)
 	selectXrayCore(mode: String!, path: String!): XrayCore! @hasRole(role: ADMIN)
 	installXrayCore(version: String!): XrayCore! @hasRole(role: ADMIN)
 	rollbackXrayCore: XrayCore! @hasRole(role: ADMIN)
