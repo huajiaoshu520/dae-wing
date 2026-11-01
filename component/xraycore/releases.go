@@ -6,17 +6,20 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -25,6 +28,7 @@ type Release struct {
 	Prerelease bool
 }
 type asset struct {
+	ID     int64  `json:"id"`
 	Name   string `json:"name"`
 	URL    string `json:"browser_download_url"`
 	Digest string `json:"digest"`
@@ -36,7 +40,55 @@ type githubRelease struct {
 	Assets     []asset `json:"assets"`
 }
 
-var downloadClient = &http.Client{Timeout: 3 * time.Minute}
+var downloadClient = newDownloadClient(false)
+var downloadHTTP1Client = newDownloadClient(true)
+
+func newDownloadClient(http1 bool) *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	t.TLSHandshakeTimeout = 10 * time.Second
+	t.ResponseHeaderTimeout = 20 * time.Second
+	if http1 {
+		t.ForceAttemptHTTP2 = false
+		t.TLSNextProto = make(map[string]func(string, *tls.Conn) http.RoundTripper)
+	}
+	return &http.Client{Transport: t, Timeout: 3 * time.Minute}
+}
+
+const downloadAttempts = 3
+
+var errDownloadIdle = errors.New("Xray download received no data for 30 seconds")
+var errAssetMetadata = errors.New("GitHub asset API returned metadata instead of archive bytes")
+
+type httpStatusError struct{ code int }
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("GitHub returned HTTP %d; check connectivity or rate limits", e.code)
+}
+
+func retryableDownload(err error) bool {
+	var status *httpStatusError
+	if errors.As(err, &status) {
+		return status.code == 408 || status.code == 429 || status.code >= 500
+	}
+	var network net.Error
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, errDownloadIdle) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+		(errors.As(err, &network) && (network.Timeout() || network.Temporary()))
+}
+
+type idleReader struct {
+	reader io.Reader
+	timer  *time.Timer
+}
+
+func (r *idleReader) Read(b []byte) (int, error) {
+	n, err := r.reader.Read(b)
+	if n > 0 {
+		r.timer.Reset(30 * time.Second)
+	}
+	return n, err
+}
 
 func executableName() string {
 	if runtime.GOOS == "windows" {
@@ -64,28 +116,102 @@ func get(ctx context.Context, address string, limit int64) ([]byte, error) {
 
 func getDownload(ctx context.Context, address string, limit int64, progress bool) ([]byte, error) {
 	if !progress {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 20*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
+		return getDownloadOnce(ctx, address, limit, false, downloadClient)
+	}
+	return getArchive(ctx, address, "", limit)
+}
+
+func getArchive(ctx context.Context, address, alternate string, limit int64) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+	defer cancel()
+	var last error
+	used := 0
+	for attempt := 1; attempt <= downloadAttempts; attempt++ {
+		used = attempt
+		detail := ""
+		if last != nil {
+			detail = last.Error()
+		}
+		reportAttempt(ctx, int32(attempt), downloadAttempts, detail)
+		client := downloadClient
+		if attempt > 1 {
+			client = downloadHTTP1Client
+		}
+		source := address
+		if attempt == 2 && alternate != "" {
+			source = alternate
+		}
+		b, err := getDownloadOnce(ctx, source, limit, true, client)
+		if err == nil {
+			return b, nil
+		}
+		last = err
+		if ctx.Err() != nil || (!retryableDownload(err) && !(alternate != "" && errors.Is(err, errAssetMetadata))) {
+			break
+		}
+		if attempt < downloadAttempts {
+			reportAttempt(ctx, int32(attempt), downloadAttempts, err.Error())
+			report(ctx, "retrying", 0, 0)
+			timer := time.NewTimer(time.Duration(attempt) * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return nil, fmt.Errorf("Xray archive download failed after %d attempt(s): %w", used, last)
+}
+
+func getDownloadOnce(ctx context.Context, address string, limit int64, progress bool, client *http.Client) ([]byte, error) {
+	var idleTimer *time.Timer
+	if progress {
+		report(ctx, "connecting", 0, 0)
+		var cancel context.CancelCauseFunc
+		ctx, cancel = context.WithCancelCause(ctx)
+		idleTimer = time.AfterFunc(30*time.Second, func() { cancel(errDownloadIdle) })
+		defer idleTimer.Stop()
+		defer cancel(nil)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "daed-xray-manager")
-	resp, err := downloadClient.Do(req)
+	if progress && strings.HasPrefix(address, "https://api.github.com/repos/XTLS/Xray-core/releases/assets/") {
+		req.Header.Set("Accept", "application/octet-stream")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	}
+	resp, err := client.Do(req)
 	if err != nil {
+		if errors.Is(context.Cause(ctx), errDownloadIdle) {
+			return nil, errDownloadIdle
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("GitHub returned HTTP %d; check connectivity or rate limits", resp.StatusCode)
+		return nil, &httpStatusError{code: resp.StatusCode}
+	}
+	if progress && strings.Contains(resp.Header.Get("Content-Type"), "json") {
+		return nil, errAssetMetadata
 	}
 	var reader io.Reader = resp.Body
 	if progress {
-		reader = &progressReader{ctx: ctx, reader: resp.Body, total: resp.ContentLength}
+		total := resp.ContentLength
+		if total < 0 || total > limit {
+			total = 0
+		}
+		report(ctx, "downloading", 0, int32(total))
+		reader = &progressReader{ctx: ctx, reader: &idleReader{reader: resp.Body, timer: idleTimer}, total: resp.ContentLength}
 	}
 	b, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil && errors.Is(context.Cause(ctx), errDownloadIdle) {
+		return nil, errDownloadIdle
+	}
 	if err == nil && int64(len(b)) > limit {
 		return nil, errors.New("Xray download exceeds size limit")
 	}
@@ -167,8 +293,12 @@ func (m *Manager) install(ctx context.Context, version string) (*Status, error) 
 	if !strings.HasPrefix(selected.Digest, "sha256:") || len(want) != 64 {
 		return nil, errors.New("official release is missing its SHA256 digest")
 	}
-	report(ctx, "downloading", 0, 0)
-	archive, err := getDownload(ctx, selected.URL, 96<<20, true)
+	primary, alternate := selected.URL, ""
+	if selected.ID > 0 {
+		primary = fmt.Sprintf("https://api.github.com/repos/XTLS/Xray-core/releases/assets/%d", selected.ID)
+		alternate = selected.URL
+	}
+	archive, err := getArchive(ctx, primary, alternate, 96<<20)
 	if err != nil {
 		return nil, err
 	}

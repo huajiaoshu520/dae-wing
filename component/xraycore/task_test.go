@@ -112,7 +112,7 @@ func TestBackgroundDownloadSurvivesRequestEndAndReportsNetworkFailure(t *testing
 		t.Fatal(err)
 	}
 	<-entered
-	if task := m.Task(); task.Phase != "downloading" {
+	if task := m.Task(); task.Phase != "connecting" {
 		t.Fatal(task)
 	}
 	close(release)
