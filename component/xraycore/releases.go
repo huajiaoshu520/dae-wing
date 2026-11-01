@@ -371,5 +371,15 @@ func (m *Manager) install(ctx context.Context, version string) (*Status, error) 
 	} else if err = os.Rename(f.Name(), target); err != nil {
 		return nil, err
 	}
-	return m.activate(ctx, Selection{Mode: "managed", Version: version})
+	status, err := m.activate(ctx, Selection{Mode: "managed", Version: version})
+	if err != nil {
+		return nil, err
+	}
+	if err = m.cleanup(ctx); err != nil {
+		message := fmt.Sprintf("Core switched, but old-version cleanup was incomplete: %v", err)
+		reportWarning(ctx, message)
+		status.Error = message
+		return status, nil
+	}
+	return m.Status(ctx), nil
 }
