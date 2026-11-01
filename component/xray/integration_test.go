@@ -18,11 +18,15 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/daeuniverse/dae-wing/component/xraycore"
 
 	D "github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/netproxy"
@@ -47,6 +51,13 @@ func TestXrayEndToEnd(t *testing.T) {
 	if _, e := exec.LookPath("xray"); e != nil {
 		t.Skip("install pinned Xray to run integration tests")
 	}
+	previousManager := xraycore.Default
+	xraycore.Default = &xraycore.Manager{}
+	xraycore.Default.SetHooks(validateCore, restartWorkers)
+	if err := xraycore.Default.Configure(t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { xraycore.Default = previousManager })
 	for _, security := range []string{"none", "reality", "reality-encrypted", "reality-encrypted-vision", "reality-encrypted-vision-udp443"} {
 		t.Run(security, func(t *testing.T) {
 			server, key, encryption := startServer(t, security)
@@ -109,6 +120,27 @@ func TestXrayEndToEnd(t *testing.T) {
 				if !bytes.Equal(got, payload) {
 					t.Fatal("TCP mismatch")
 				}
+			}
+			checkTCP()
+			// A core switch validates existing node configurations, then reaps
+			// workers. A rejected core must leave live workers usable.
+			binary, _ := exec.LookPath("xray")
+			if _, err := xraycore.Default.Select(context.Background(), "system", binary); err != nil {
+				t.Fatal(err)
+			}
+			if len(d.workers) != 0 {
+				t.Fatal("core switch kept old workers")
+			}
+			checkTCP()
+			bad := filepath.Join(t.TempDir(), "incompatible-xray")
+			if err := os.WriteFile(bad, []byte("#!/bin/sh\nif [ \"$1\" = version ]; then echo 'Xray 0.0.0'; else exit 1; fi\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := xraycore.Default.Select(context.Background(), "system", bad); err == nil {
+				t.Fatal("accepted incompatible core")
+			}
+			if len(d.workers) == 0 {
+				t.Fatal("failed core switch stopped working core")
 			}
 			checkTCP()
 			udp, e := net.ListenPacket("udp4", "127.0.0.1:0")
