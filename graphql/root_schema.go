@@ -54,6 +54,9 @@ type XrayTask {
 	phase: String!
 	downloadedBytes: Int!
 	totalBytes: Int!
+	attempt: Int!
+	maxAttempts: Int!
+	lastError: String!
 	error: String!
 }
 type XrayCore {
