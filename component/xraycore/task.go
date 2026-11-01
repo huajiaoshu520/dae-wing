@@ -23,6 +23,18 @@ type Task struct {
 	DownloadedBytes int32
 	TotalBytes      int32
 	Error           string
+	Attempt         int32
+	MaxAttempts     int32
+	LastError       string
+}
+
+type attemptKey struct{}
+type attemptFunc func(int32, int32, string)
+
+func reportAttempt(ctx context.Context, attempt, max int32, lastError string) {
+	if notify, ok := ctx.Value(attemptKey{}).(attemptFunc); ok {
+		notify(attempt, max, lastError)
+	}
 }
 
 type progressKey struct{}
@@ -102,6 +114,12 @@ func (m *Manager) StartTask(kind, version, path string) (*Task, error) {
 			}
 			m.taskMu.Unlock()
 		}))
+		ctx = context.WithValue(ctx, attemptKey{}, attemptFunc(func(attempt, max int32, lastError string) {
+			m.taskMu.Lock()
+			m.task.Attempt, m.task.MaxAttempts, m.task.LastError = attempt, max, lastError
+			m.task.DownloadedBytes, m.task.TotalBytes = 0, 0
+			m.taskMu.Unlock()
+		}))
 		var err error
 		switch kind {
 		case "install":
@@ -117,6 +135,7 @@ func (m *Manager) StartTask(kind, version, path string) (*Task, error) {
 			m.task.Error = fmt.Sprintf("%s: %v", m.task.Phase, err)
 		} else {
 			m.task.Status, m.task.Phase = "succeeded", "done"
+			m.task.LastError = ""
 		}
 		finished := m.task
 		m.taskMu.Unlock()
