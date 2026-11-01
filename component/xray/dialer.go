@@ -42,9 +42,6 @@ func NewVLESS(option *D.ExtraOption, next netproxy.Dialer, link string) (netprox
 	}
 	life, cancel := context.WithCancel(context.Background())
 	d := &Dialer{node: config, next: next, workers: map[string]*worker{}, life: life, cancel: cancel}
-	activeDialers.Lock()
-	activeDialers.items[d] = struct{}{}
-	activeDialers.Unlock()
 	return d, &D.Property{Name: config.name, Address: config.address, Protocol: "vless", Link: link}, nil
 }
 
@@ -112,6 +109,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (netp
 		w, e = d.start(ctx, key)
 		if e == nil {
 			d.workers[key] = w
+			activeDialers.Lock()
+			activeDialers.items[d] = struct{}{}
+			activeDialers.Unlock()
 		}
 	}
 	d.mu.Unlock()
@@ -154,12 +154,12 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (netp
 }
 
 func (d *Dialer) Close() error {
-	activeDialers.Lock()
-	delete(activeDialers.items, d)
-	activeDialers.Unlock()
 	d.cancel()
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	activeDialers.Lock()
+	delete(activeDialers.items, d)
+	activeDialers.Unlock()
 	if d.closed {
 		return nil
 	}
