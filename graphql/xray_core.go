@@ -3,8 +3,15 @@ package graphql
 
 import (
 	"context"
+
 	"github.com/daeuniverse/dae-wing/component/xraycore"
 )
+
+func (*queryResolver) XrayTask() *xraycore.Task { return xraycore.Default.Task() }
+
+func (*MutationResolver) StartXrayTask(args struct{ Kind, Version, Path string }) (*xraycore.Task, error) {
+	return xraycore.Default.StartTask(args.Kind, args.Version, args.Path)
+}
 
 func (*queryResolver) XrayCore(ctx context.Context) *xraycore.Status {
 	return xraycore.Default.Status(ctx)
