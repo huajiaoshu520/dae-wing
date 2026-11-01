@@ -10,10 +10,13 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"os/exec"
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/daeuniverse/dae-wing/component/xraycore"
 
 	D "github.com/daeuniverse/outbound/dialer"
 	"github.com/daeuniverse/outbound/dialer/v2ray"
@@ -38,7 +41,11 @@ func NewVLESS(option *D.ExtraOption, next netproxy.Dialer, link string) (netprox
 		return nil, nil, e
 	}
 	life, cancel := context.WithCancel(context.Background())
-	return &Dialer{node: config, next: next, workers: map[string]*worker{}, life: life, cancel: cancel}, &D.Property{Name: config.name, Address: config.address, Protocol: "vless", Link: link}, nil
+	d := &Dialer{node: config, next: next, workers: map[string]*worker{}, life: life, cancel: cancel}
+	activeDialers.Lock()
+	activeDialers.items[d] = struct{}{}
+	activeDialers.Unlock()
+	return d, &D.Property{Name: config.name, Address: config.address, Protocol: "vless", Link: link}, nil
 }
 
 type Dialer struct {
@@ -51,10 +58,13 @@ type Dialer struct {
 	workers map[string]*worker
 }
 type worker struct {
-	cmd  *exec.Cmd
-	done chan struct{}
-	gate *gateway
-	link string
+	cmd    *exec.Cmd
+	done   chan struct{}
+	gate   *gateway
+	link   string
+	binary string
+	stamp  time.Time
+	size   int64
 }
 
 func (w *worker) stop() { w.gate.Close(); _ = w.cmd.Process.Kill(); <-w.done }
@@ -78,6 +88,17 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (netp
 		return nil, net.ErrClosed
 	}
 	w := d.workers[key]
+	if w != nil {
+		// System package upgrades commonly replace xray at the same path. Pick up
+		// that replacement on the next dial, without requiring a daed restart.
+		path, err := xraycore.Default.Binary()
+		info, statErr := os.Stat(path)
+		if err == nil && statErr == nil && (path != w.binary || !info.ModTime().Equal(w.stamp) || info.Size() != w.size) {
+			w.stop()
+			delete(d.workers, key)
+			w = nil
+		}
+	}
 	if w != nil {
 		select {
 		case <-w.done:
@@ -133,6 +154,9 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (netp
 }
 
 func (d *Dialer) Close() error {
+	activeDialers.Lock()
+	delete(activeDialers.items, d)
+	activeDialers.Unlock()
 	d.cancel()
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -148,7 +172,7 @@ func (d *Dialer) Close() error {
 }
 
 func (d *Dialer) start(ctx context.Context, network string) (*worker, error) {
-	binary, e := exec.LookPath("xray")
+	binary, e := xraycore.Default.Binary()
 	if e != nil {
 		return nil, errors.New("XHTTP requires the bundled xray executable; update the daed image")
 	}
@@ -187,7 +211,10 @@ func (d *Dialer) start(ctx context.Context, network string) (*worker, error) {
 	if e = cmd.Start(); e != nil {
 		return nil, fmt.Errorf("start Xray: %w", e)
 	}
-	w := &worker{cmd: cmd, done: make(chan struct{}), gate: gate}
+	w := &worker{cmd: cmd, done: make(chan struct{}), gate: gate, binary: binary}
+	if info, err := os.Stat(binary); err == nil {
+		w.stamp, w.size = info.ModTime(), info.Size()
+	}
 	go func() { _ = cmd.Wait(); gate.Close(); close(w.done) }()
 	startup, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
