@@ -122,16 +122,26 @@ func TestInstallChecksDigestAndPreservesSelection(t *testing.T) {
 	if err := m.Configure(t.TempDir()); err != nil {
 		t.Fatal(err)
 	}
+	oldVersion := filepath.Join(m.dir, "v26.10.21")
+	if err := os.MkdirAll(oldVersion, 0700); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := m.Install(context.Background(), "v26.10.31"); err == nil || !strings.Contains(err.Error(), "SHA256 mismatch") {
 		t.Fatalf("tampered core: %v", err)
 	}
 	if m.state.Current.Mode != "" {
 		t.Fatal("tampered install changed core")
 	}
+	if _, err := os.Stat(oldVersion); err != nil {
+		t.Fatal("failed download removed old version", err)
+	}
 	bad = false
 	s, err := m.Install(context.Background(), "v26.10.31")
 	if err != nil || s.Mode != "managed" || s.Version != "26.10.31" {
 		t.Fatalf("install: %+v %v", s, err)
+	}
+	if _, err := os.Stat(oldVersion); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("successful install kept obsolete version", err)
 	}
 	if _, err := os.Stat(filepath.Join(m.dir, "escaped")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("archive path escaped")

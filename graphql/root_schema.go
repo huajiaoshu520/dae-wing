@@ -57,6 +57,7 @@ type XrayTask {
 	attempt: Int!
 	maxAttempts: Int!
 	lastError: String!
+	warning: String!
 	error: String!
 }
 type XrayCore {
