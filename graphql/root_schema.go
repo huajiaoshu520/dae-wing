@@ -42,8 +42,24 @@ type Query {
 	nodes(id: ID, subscriptionId: ID, first: Int, after: ID): NodesConnection! @hasRole(role: ADMIN)
 	nodeLatencies(ids: [ID!]): [NodeLatency!]! @hasRole(role: ADMIN)
 	general: General! @hasRole(role: ADMIN)
+	xrayCore: XrayCore! @hasRole(role: ADMIN)
+	xrayReleases: [XrayRelease!]! @hasRole(role: ADMIN)
+}
+type XrayCore {
+	mode: String!
+	path: String!
+	version: String!
+	error: String!
+	canRollback: Boolean!
+}
+type XrayRelease {
+	version: String!
+	prerelease: Boolean!
 }
 type Mutation {
+	selectXrayCore(mode: String!, path: String!): XrayCore! @hasRole(role: ADMIN)
+	installXrayCore(version: String!): XrayCore! @hasRole(role: ADMIN)
+	rollbackXrayCore: XrayCore! @hasRole(role: ADMIN)
 	# createUser creates a user if there is no user.
 	createUser(username: String!, password: String!): String!
 	# createConfig creates a global config. Null arguments will be converted to default value.

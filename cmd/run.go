@@ -15,6 +15,7 @@ import (
 
 	"github.com/daeuniverse/dae-wing/cmd/internal"
 	"github.com/daeuniverse/dae-wing/common"
+	"github.com/daeuniverse/dae-wing/component/xraycore"
 	"github.com/daeuniverse/dae-wing/dae"
 	"github.com/daeuniverse/dae-wing/db"
 	"github.com/daeuniverse/dae-wing/graphql"
@@ -78,6 +79,9 @@ var (
 			}
 
 			// Read config from --config cfgDir.
+			if err := xraycore.Default.Configure(cfgDir); err != nil {
+				logrus.Fatalln("Failed to configure Xray manager:", err)
+			}
 			if err := db.InitDatabase(cfgDir); err != nil {
 				logrus.Fatalln("Failed to init db:", err)
 			}

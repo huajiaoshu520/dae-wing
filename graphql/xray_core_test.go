@@ -1,0 +1,33 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+package graphql
+
+import (
+	"context"
+	"testing"
+)
+
+func TestXrayCoreSchema(t *testing.T) {
+	schema, err := Schema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The core manager can execute binaries: no unauthenticated access, including
+	// the release-list query and the rollback mutation.
+	for _, query := range []string{
+		`{ xrayCore { mode path version error canRollback } }`,
+		`{ xrayReleases { version prerelease } }`,
+		`mutation { selectXrayCore(mode:"system", path:"/not/executed") { mode } }`,
+		`mutation { installXrayCore(version:"v26.10.31") { mode } }`,
+		`mutation { rollbackXrayCore { mode } }`,
+	} {
+		response := schema.Exec(context.Background(), query, "", nil)
+		if len(response.Errors) == 0 {
+			t.Fatalf("unprotected core operation: %s", query)
+		}
+	}
+	ctx := context.WithValue(context.Background(), "role", "ADMIN")
+	response := schema.Exec(ctx, `{ xrayCore { mode path version error canRollback } }`, "", nil)
+	if len(response.Errors) > 0 {
+		t.Fatal(response.Errors)
+	}
+}
