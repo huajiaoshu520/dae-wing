@@ -26,6 +26,15 @@ type Task struct {
 	Attempt         int32
 	MaxAttempts     int32
 	LastError       string
+	Warning         string
+}
+
+type warningKey struct{}
+
+func reportWarning(ctx context.Context, message string) {
+	if notify, ok := ctx.Value(warningKey{}).(func(string)); ok {
+		notify(message)
+	}
 }
 
 type attemptKey struct{}
@@ -80,7 +89,7 @@ func (m *Manager) StartTask(kind, version, path string) (*Task, error) {
 	if m.dir == "" {
 		return nil, errors.New("Xray manager has not been configured")
 	}
-	if kind != "install" && kind != "system" && kind != "bundled" && kind != "rollback" {
+	if kind != "install" && kind != "system" && kind != "bundled" && kind != "rollback" && kind != "cleanup" {
 		return nil, errors.New("invalid Xray task kind")
 	}
 	if kind == "install" && !versionPattern.MatchString(version) {
@@ -121,11 +130,14 @@ func (m *Manager) StartTask(kind, version, path string) (*Task, error) {
 			m.taskMu.Unlock()
 		}))
 		var err error
+		ctx = context.WithValue(ctx, warningKey{}, func(message string) { m.taskMu.Lock(); m.task.Warning = message; m.taskMu.Unlock() })
 		switch kind {
 		case "install":
 			_, err = m.install(ctx, version)
 		case "rollback":
 			_, err = m.rollback(ctx)
+		case "cleanup":
+			err = m.cleanup(ctx)
 		default:
 			_, err = m.selectCore(ctx, kind, path)
 		}
