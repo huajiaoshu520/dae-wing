@@ -44,7 +44,19 @@ type Query {
 	general: General! @hasRole(role: ADMIN)
 	xrayCore: XrayCore! @hasRole(role: ADMIN)
 	xrayReleases: [XrayRelease!]! @hasRole(role: ADMIN)
+	geodataStatus: GeodataStatus! @hasRole(role: ADMIN)
 	xrayTask: XrayTask! @hasRole(role: ADMIN)
+}
+type GeodataStatus {
+ daily: Boolean!
+ running: Boolean!
+ error: String!
+ files: [GeodataFile!]!
+}
+type GeodataFile {
+ name: String!
+ path: String!
+ updated: String!
 }
 type XrayTask {
 	id: String!
@@ -72,6 +84,8 @@ type XrayRelease {
 	prerelease: Boolean!
 }
 type Mutation {
+ updateGeodata: Boolean! @hasRole(role: ADMIN)
+ setGeodataDaily(enabled: Boolean!): Boolean! @hasRole(role: ADMIN)
 	startXrayTask(kind: String!, version: String!, path: String!): XrayTask! @hasRole(role: ADMIN)
 	selectXrayCore(mode: String!, path: String!): XrayCore! @hasRole(role: ADMIN)
 	installXrayCore(version: String!): XrayCore! @hasRole(role: ADMIN)

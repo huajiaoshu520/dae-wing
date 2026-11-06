@@ -15,6 +15,7 @@ import (
 
 	"github.com/daeuniverse/dae-wing/cmd/internal"
 	"github.com/daeuniverse/dae-wing/common"
+	"github.com/daeuniverse/dae-wing/component/geodata"
 	"github.com/daeuniverse/dae-wing/component/xraycore"
 	"github.com/daeuniverse/dae-wing/dae"
 	"github.com/daeuniverse/dae-wing/db"
@@ -88,6 +89,8 @@ var (
 
 			subscription.UpdateAll(context.TODO())
 
+			geoDirs := geodata.Default.Configure(cmd.Context(), cfgDir)
+
 			// Run dae.
 			var logOpts *lumberjack.Logger
 			if logFile != "" {
@@ -106,7 +109,7 @@ var (
 				if err := dae.Run(
 					logrus.StandardLogger(),
 					dae.EmptyConfig,
-					[]string{cfgDir},
+					geoDirs,
 					disableTimestamp,
 					apiOnly,
 				); err != nil {
