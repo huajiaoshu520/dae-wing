@@ -27,11 +27,11 @@ func TestDownloadRejectsCorruptRules(t *testing.T) {
 	defer server.Close()
 	path := filepath.Join(t.TempDir(), "geosite.dat")
 	asset := releaseAsset{URL: server.URL, Digest: fmt.Sprintf("sha256:%x", sha256.Sum256(body))}
-	if err := download(context.Background(), path, asset, &data.GeoSiteList{}); err != nil {
+	if err := downloadRule(context.Background(), server.URL, path, asset, &data.GeoSiteList{}); err != nil {
 		t.Fatal(err)
 	}
 	body[10] ^= 1
-	if err := download(context.Background(), path, asset, &data.GeoSiteList{}); err == nil {
+	if err := downloadRule(context.Background(), server.URL, path, asset, &data.GeoSiteList{}); err == nil {
 		t.Fatal("corrupt data accepted")
 	}
 	saved, err := os.ReadFile(path)
@@ -68,5 +68,28 @@ func TestSchedulePersistsTimeAcrossToggle(t *testing.T) {
 	}
 	if enabled, at := m.daily(); !enabled || at != "05:30" {
 		t.Fatalf("re-enabled schedule: %v %s", enabled, at)
+	}
+}
+
+func TestFetchRuleFallsBackToUpstreamReleaseBranch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api" {
+			if r.Header.Get("Accept") != "application/octet-stream" {
+				t.Error("missing binary Accept header")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("{}"))
+			return
+		}
+		if r.URL.Path == "/browser" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_, _ = w.Write([]byte("rule bytes"))
+	}))
+	defer server.Close()
+	body, err := fetchRule(context.Background(), server.URL+"/api", server.URL+"/browser", server.URL+"/raw", 1024)
+	if err != nil || string(body) != "rule bytes" {
+		t.Fatalf("fallback: %q, %v", body, err)
 	}
 }

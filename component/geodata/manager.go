@@ -5,13 +5,17 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/daeuniverse/dae/common/assets"
@@ -245,6 +249,7 @@ func (m *Manager) update(ctx context.Context) (bool, error) {
 }
 
 type releaseAsset struct {
+	ID     int64
 	Name   string
 	URL    string `json:"browser_download_url"`
 	Digest string
@@ -272,7 +277,7 @@ func latestRelease(ctx context.Context) (map[string]releaseAsset, error) {
 		if asset.Name != "geoip.dat" && asset.Name != "geosite.dat" {
 			continue
 		}
-		if !strings.HasPrefix(asset.URL, "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/") ||
+		if asset.ID <= 0 || !strings.HasPrefix(asset.URL, "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/download/") ||
 			!strings.HasSuffix(asset.URL, "/"+asset.Name) || !strings.HasPrefix(asset.Digest, "sha256:") || len(asset.Digest) != 71 {
 			return nil, fmt.Errorf("invalid release metadata for %s", asset.Name)
 		}
@@ -285,20 +290,13 @@ func latestRelease(ctx context.Context) (map[string]releaseAsset, error) {
 }
 
 func download(ctx context.Context, path string, asset releaseAsset, message proto.Message) error {
+	apiURL := fmt.Sprintf("https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/assets/%d", asset.ID)
+	return downloadRule(ctx, apiURL, path, asset, message)
+}
+
+func downloadRule(ctx context.Context, apiURL, path string, asset releaseAsset, message proto.Message) error {
 	const limit = 64 << 20
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, asset.URL, nil)
-	if err != nil {
-		return err
-	}
-	response, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %s", response.Status)
-	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	body, err := fetchRule(ctx, apiURL, asset.URL, "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/"+asset.Name, limit)
 	if err != nil {
 		return err
 	}
@@ -316,4 +314,67 @@ func download(ctx context.Context, path string, asset releaseAsset, message prot
 		return fmt.Errorf("empty rule list")
 	}
 	return os.WriteFile(path, body, 0600)
+}
+
+type assetHTTPError struct{ code int }
+
+func (e *assetHTTPError) Error() string { return fmt.Sprintf("GitHub returned HTTP %d", e.code) }
+
+var errAssetJSON = errors.New("GitHub asset API returned metadata")
+
+func fetchRule(ctx context.Context, apiURL, browserURL, rawURL string, limit int64) ([]byte, error) {
+	var last error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		api := attempt == 1
+		address := []string{apiURL, browserURL, rawURL}[attempt-1]
+		attemptCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
+		body, err := fetchRuleOnce(attemptCtx, address, api, limit)
+		cancel()
+		if err == nil {
+			return body, nil
+		}
+		var requestErr *url.Error
+		if errors.As(err, &requestErr) {
+			err = requestErr.Err
+		}
+		last = fmt.Errorf("attempt %d/3: %w", attempt, err)
+		var status *assetHTTPError
+		var network net.Error
+		if errors.As(err, &status) {
+			if status.code != 403 && status.code != 404 && status.code != 408 && status.code != 429 && status.code < 500 {
+				break
+			}
+		} else if !(errors.Is(err, errAssetJSON) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) ||
+			errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
+			errors.As(err, &network)) {
+			break
+		}
+	}
+	return nil, last
+}
+
+func fetchRuleOnce(ctx context.Context, url string, api bool, limit int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	if api {
+		req.Header.Set("Accept", "application/octet-stream")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	}
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return nil, &assetHTTPError{response.StatusCode}
+	}
+	if api && strings.Contains(response.Header.Get("Content-Type"), "json") {
+		return nil, errAssetJSON
+	}
+	return io.ReadAll(io.LimitReader(response.Body, limit+1))
 }
