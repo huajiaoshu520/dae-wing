@@ -29,6 +29,7 @@ type Manager struct {
 	running     bool
 	lastError   string
 	nextAttempt time.Time
+	restart     func() error
 }
 
 type File struct {
@@ -38,12 +39,14 @@ type File struct {
 type Status struct {
 	Daily, Running bool
 	Error          string
+	UpdateTime     string
 	Files          []*File
 }
 
-func (m *Manager) Configure(ctx context.Context, configDir string) []string {
+func (m *Manager) Configure(ctx context.Context, configDir string, restart func() error) []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.restart = restart
 	m.root = filepath.Join(configDir, "geodata")
 	m.dirs = []string{filepath.Join(m.root, "current"), configDir}
 	go m.schedule(ctx)
@@ -59,28 +62,38 @@ func (m *Manager) schedule(ctx context.Context) {
 			return
 		case <-ticker.C:
 			m.mu.Lock()
-			info, err := os.Stat(filepath.Join(m.root, "current"))
-			due := err != nil || time.Since(info.ModTime()) >= 24*time.Hour
-			if m.daily() && due && !m.running && !time.Now().Before(m.nextAttempt) {
-				m.start(ctx)
+			now := time.Now().In(updateZone)
+			daily, at := m.daily()
+			checked, _ := os.ReadFile(filepath.Join(m.root, "last-check"))
+			if daily && now.Format("15:04") >= at && string(checked) != now.Format(time.DateOnly) && !m.running && !now.Before(m.nextAttempt) {
+				m.start(ctx, now.Format(time.DateOnly))
 			}
 			m.mu.Unlock()
 		}
 	}
 }
 
-func (m *Manager) daily() bool {
+const defaultUpdateTime = "04:17"
+
+var updateZone = time.FixedZone("UTC+8", 8*60*60)
+
+func (m *Manager) daily() (bool, string) {
 	if m.root == "" {
-		return false
+		return false, defaultUpdateTime
 	}
-	_, err := os.Stat(filepath.Join(m.root, "daily"))
-	return err == nil
+	value, err := os.ReadFile(filepath.Join(m.root, "daily"))
+	if len(value) == 0 {
+		return err == nil, defaultUpdateTime
+	}
+	at, disabled := strings.CutPrefix(string(value), "off:")
+	return err == nil && !disabled, at
 }
 
 func (m *Manager) Status() *Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	status := &Status{Daily: m.daily(), Running: m.running, Error: m.lastError, Files: []*File{}}
+	daily, at := m.daily()
+	status := &Status{Daily: daily, UpdateTime: at, Running: m.running, Error: m.lastError, Files: []*File{}}
 	finder := assets.NewLocationFinder(m.dirs)
 	for _, name := range []string{"geoip.dat", "geosite.dat"} {
 		file := &File{Name: name}
@@ -95,23 +108,27 @@ func (m *Manager) Status() *Status {
 	return status
 }
 
-func (m *Manager) SetDaily(enabled bool) error {
+func (m *Manager) SetDaily(enabled bool, at string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.root == "" {
 		return fmt.Errorf("geodata manager is unavailable")
 	}
 	path := filepath.Join(m.root, "daily")
-	if !enabled {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
-	}
 	if err := os.MkdirAll(m.root, 0700); err != nil {
 		return err
 	}
-	return os.WriteFile(path, nil, 0600)
+	if at == "" {
+		_, at = m.daily()
+	}
+	parsed, err := time.Parse("15:04", at)
+	if err != nil || parsed.Format("15:04") != at {
+		return fmt.Errorf("expected update time in HH:MM format")
+	}
+	if !enabled {
+		at = "off:" + at
+	}
+	return os.WriteFile(path, []byte(at), 0600)
 }
 
 func (m *Manager) Start() error {
@@ -120,18 +137,26 @@ func (m *Manager) Start() error {
 	if m.root == "" || m.running {
 		return fmt.Errorf("geodata manager is unavailable or updating")
 	}
-	m.start(context.Background())
+	m.start(context.Background(), "")
 	return nil
 }
 
-func (m *Manager) start(parent context.Context) {
+func (m *Manager) start(parent context.Context, date string) {
 	m.running = true
 	m.lastError = ""
 	m.nextAttempt = time.Now().Add(time.Hour)
 	go func() {
 		ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 		defer cancel()
-		err := m.update(ctx)
+		changed, err := m.update(ctx)
+		if err == nil && date != "" {
+			err = os.WriteFile(filepath.Join(m.root, "last-check"), []byte(date), 0600)
+		}
+		if changed && m.restart != nil {
+			if restartErr := m.restart(); restartErr != nil && err == nil {
+				err = restartErr
+			}
+		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		m.running = false
@@ -142,13 +167,41 @@ func (m *Manager) start(parent context.Context) {
 	}()
 }
 
-func (m *Manager) update(ctx context.Context) error {
+func (m *Manager) update(ctx context.Context) (bool, error) {
 	if err := os.MkdirAll(m.root, 0700); err != nil {
-		return err
+		return false, err
+	}
+	release, err := latestRelease(ctx)
+	if err != nil {
+		return false, err
+	}
+	finder := assets.NewLocationFinder(m.dirs)
+	unchanged := true
+	for name, asset := range release {
+		path, err := finder.GetLocationAsset(logrus.StandardLogger(), name)
+		if err != nil {
+			unchanged = false
+			break
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			unchanged = false
+			break
+		}
+		hash := sha256.New()
+		_, err = io.Copy(hash, io.LimitReader(file, (64<<20)+1))
+		_ = file.Close()
+		if err != nil || fmt.Sprintf("sha256:%x", hash.Sum(nil)) != asset.Digest {
+			unchanged = false
+			break
+		}
+	}
+	if unchanged {
+		return false, nil
 	}
 	dir, err := os.MkdirTemp(m.root, "release-")
 	if err != nil {
-		return err
+		return false, err
 	}
 	committed := false
 	defer func() {
@@ -156,10 +209,6 @@ func (m *Manager) update(ctx context.Context) error {
 			_ = os.RemoveAll(dir)
 		}
 	}()
-	release, err := latestRelease(ctx)
-	if err != nil {
-		return err
-	}
 	for _, file := range []struct {
 		name    string
 		message proto.Message
@@ -167,22 +216,22 @@ func (m *Manager) update(ctx context.Context) error {
 		{"geoip.dat", &data.GeoIPList{}}, {"geosite.dat", &data.GeoSiteList{}},
 	} {
 		if err := download(ctx, filepath.Join(dir, file.name), release[file.name], file.message); err != nil {
-			return fmt.Errorf("%s: %w", file.name, err)
+			return false, fmt.Errorf("%s: %w", file.name, err)
 		}
 	}
 	current := filepath.Join(m.root, "current")
 	previous, _ := os.Readlink(current)
 	link := filepath.Join(dir, ".activate")
 	if err := os.Symlink(filepath.Base(dir), link); err != nil {
-		return err
+		return false, err
 	}
 	if err := os.Rename(link, current); err != nil {
-		return err
+		return false, err
 	}
 	committed = true
 	entries, err := os.ReadDir(m.root)
 	if err != nil {
-		return nil
+		return true, nil
 	}
 	for _, entry := range entries {
 		name := entry.Name()
@@ -192,7 +241,7 @@ func (m *Manager) update(ctx context.Context) error {
 			}
 		}
 	}
-	return nil
+	return true, nil
 }
 
 type releaseAsset struct {

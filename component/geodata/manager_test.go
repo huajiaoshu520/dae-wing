@@ -42,3 +42,31 @@ func TestDownloadRejectsCorruptRules(t *testing.T) {
 		t.Fatal("valid file replaced")
 	}
 }
+
+func TestSchedulePersistsTimeAcrossToggle(t *testing.T) {
+	m := Manager{root: t.TempDir()}
+	if err := os.WriteFile(filepath.Join(m.root, "daily"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, at := m.daily(); !enabled || at != "04:17" {
+		t.Fatalf("legacy schedule: %v %s", enabled, at)
+	}
+	if err := m.SetDaily(true, "05:30"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.SetDaily(false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, at := m.daily(); enabled || at != "05:30" {
+		t.Fatalf("disabled schedule: %v %s", enabled, at)
+	}
+	if err := m.SetDaily(true, "25:30"); err == nil {
+		t.Fatal("invalid time accepted")
+	}
+	if err := m.SetDaily(true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if enabled, at := m.daily(); !enabled || at != "05:30" {
+		t.Fatalf("re-enabled schedule: %v %s", enabled, at)
+	}
+}
