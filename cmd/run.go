@@ -89,7 +89,7 @@ var (
 
 			subscription.UpdateAll(context.TODO())
 
-			geoDirs := geodata.Default.Configure(cmd.Context(), cfgDir)
+			geoDirs := geodata.Default.Configure(cmd.Context(), cfgDir, restartAfterGeodata)
 
 			// Run dae.
 			var logOpts *lumberjack.Logger
@@ -252,4 +252,12 @@ func auth(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// Docker's restart policy starts daed again after the normal SIGTERM shutdown.
+func restartAfterGeodata() error {
+	if os.Getenv("DAED_RESTART_ON_GEODATA") != "1" {
+		return nil
+	}
+	return syscall.Kill(os.Getpid(), syscall.SIGTERM)
 }
