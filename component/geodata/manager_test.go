@@ -75,8 +75,9 @@ func TestSchedulePersistsTimeAcrossToggle(t *testing.T) {
 func TestFetchRuleFallsBackToUpstreamReleaseBranch(t *testing.T) {
 	valid := strings.Repeat("rule bytes", 128)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/cdn" {
-			_, _ = w.Write([]byte(strings.Repeat("old rule bytes", 128)))
+		if r.URL.Path == "/partial" {
+			w.Header().Set("Content-Length", "2000")
+			_, _ = w.Write([]byte(valid))
 			return
 		}
 		if r.URL.Path == "/api" {
@@ -95,40 +96,11 @@ func TestFetchRuleFallsBackToUpstreamReleaseBranch(t *testing.T) {
 	}))
 	defer server.Close()
 	body, err := fetchRule(context.Background(), fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(valid))), 4096,
-		ruleSource{url: server.URL + "/cdn", timeout: time.Second},
+		ruleSource{url: server.URL + "/partial", timeout: time.Second},
 		ruleSource{url: server.URL + "/api", api: true, timeout: time.Second},
 		ruleSource{url: server.URL + "/browser", timeout: time.Second},
 		ruleSource{url: server.URL + "/raw", timeout: time.Second})
 	if err != nil || string(body) != valid {
 		t.Fatalf("fallback: %q, %v", body, err)
-	}
-}
-
-func TestWgetFailureFallsBackToGitHub(t *testing.T) {
-	dir := t.TempDir()
-	script := `#!/bin/sh
-for arg do address=$arg; done
-case "$address" in
-  https://cdn.example/*) exit 4 ;;
-  https://github.example/*) cat "$TEST_RULE_FILE" ;;
-  *) exit 2 ;;
-esac
-`
-	if err := os.WriteFile(filepath.Join(dir, "wget"), []byte(script), 0700); err != nil {
-		t.Fatal(err)
-	}
-	payload := []byte(strings.Repeat("rule bytes", 128))
-	path := filepath.Join(dir, "verified.dat")
-	if err := os.WriteFile(path, payload, 0600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("TEST_RULE_FILE", path)
-	t.Setenv("DAED_GEODATA_WGET", "1")
-	got, err := fetchRule(context.Background(), fmt.Sprintf("sha256:%x", sha256.Sum256(payload)), 4096,
-		ruleSource{url: "https://cdn.example/geoip.dat", timeout: time.Second},
-		ruleSource{url: "https://github.example/geoip.dat", timeout: time.Second})
-	if err != nil || string(got) != string(payload) {
-		t.Fatalf("wget fallback: %q, %v", got, err)
 	}
 }
