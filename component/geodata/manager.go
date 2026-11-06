@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -150,7 +151,7 @@ func (m *Manager) start(parent context.Context, date string) {
 	m.lastError = ""
 	m.nextAttempt = time.Now().Add(time.Hour)
 	go func() {
-		ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
+		ctx, cancel := context.WithTimeout(parent, 6*time.Minute)
 		defer cancel()
 		changed, err := m.update(ctx)
 		if err == nil && date != "" {
@@ -256,6 +257,8 @@ type releaseAsset struct {
 }
 
 func latestRelease(ctx context.Context) (map[string]releaseAsset, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest", nil)
 	if err != nil {
 		return nil, err
@@ -291,20 +294,19 @@ func latestRelease(ctx context.Context) (map[string]releaseAsset, error) {
 
 func download(ctx context.Context, path string, asset releaseAsset, message proto.Message) error {
 	apiURL := fmt.Sprintf("https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/assets/%d", asset.ID)
-	return downloadRule(ctx, apiURL, path, asset, message)
+	return downloadRule(ctx, path, asset, message,
+		ruleSource{url: "https://cdn.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/" + asset.Name, timeout: 45 * time.Second},
+		ruleSource{url: apiURL, api: true, timeout: 30 * time.Second},
+		ruleSource{url: asset.URL, timeout: 30 * time.Second},
+		ruleSource{url: "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/" + asset.Name, timeout: 60 * time.Second},
+	)
 }
 
-func downloadRule(ctx context.Context, apiURL, path string, asset releaseAsset, message proto.Message) error {
+func downloadRule(ctx context.Context, path string, asset releaseAsset, message proto.Message, sources ...ruleSource) error {
 	const limit = 64 << 20
-	body, err := fetchRule(ctx, apiURL, asset.URL, "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/"+asset.Name, limit)
+	body, err := fetchRule(ctx, asset.Digest, limit, sources...)
 	if err != nil {
 		return err
-	}
-	if len(body) < 1024 || len(body) > limit {
-		return fmt.Errorf("unexpected file size: %d", len(body))
-	}
-	if fmt.Sprintf("sha256:%x", sha256.Sum256(body)) != asset.Digest {
-		return fmt.Errorf("SHA-256 mismatch")
 	}
 	if err := proto.Unmarshal(body, message); err != nil {
 		return err
@@ -318,38 +320,54 @@ func downloadRule(ctx context.Context, apiURL, path string, asset releaseAsset, 
 
 type assetHTTPError struct{ code int }
 
-func (e *assetHTTPError) Error() string { return fmt.Sprintf("GitHub returned HTTP %d", e.code) }
+func (e *assetHTTPError) Error() string {
+	return fmt.Sprintf("download source returned HTTP %d", e.code)
+}
 
 var errAssetJSON = errors.New("GitHub asset API returned metadata")
 
-func fetchRule(ctx context.Context, apiURL, browserURL, rawURL string, limit int64) ([]byte, error) {
+type ruleSource struct {
+	url     string
+	api     bool
+	timeout time.Duration
+}
+
+func fetchRule(ctx context.Context, digest string, limit int64, sources ...ruleSource) ([]byte, error) {
 	var last error
-	for attempt := 1; attempt <= 3; attempt++ {
+	for i, source := range sources {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		api := attempt == 1
-		address := []string{apiURL, browserURL, rawURL}[attempt-1]
-		attemptCtx, cancel := context.WithTimeout(ctx, 40*time.Second)
-		body, err := fetchRuleOnce(attemptCtx, address, api, limit)
+		attemptCtx, cancel := context.WithTimeout(ctx, source.timeout)
+		body, err := fetchRuleOnce(attemptCtx, source.url, source.api, limit)
 		cancel()
 		if err == nil {
-			return body, nil
+			switch {
+			case len(body) < 1024 || int64(len(body)) > limit:
+				err = fmt.Errorf("unexpected file size: %d", len(body))
+			case fmt.Sprintf("sha256:%x", sha256.Sum256(body)) != digest:
+				err = errors.New("SHA-256 mismatch")
+			default:
+				return body, nil
+			}
+			last = fmt.Errorf("attempt %d/%d: %w", i+1, len(sources), err)
+			continue
 		}
 		var requestErr *url.Error
 		if errors.As(err, &requestErr) {
 			err = requestErr.Err
 		}
-		last = fmt.Errorf("attempt %d/3: %w", attempt, err)
+		last = fmt.Errorf("attempt %d/%d: %w", i+1, len(sources), err)
 		var status *assetHTTPError
 		var network net.Error
+		var wgetExit *exec.ExitError
 		if errors.As(err, &status) {
 			if status.code != 403 && status.code != 404 && status.code != 408 && status.code != 429 && status.code < 500 {
 				break
 			}
 		} else if !(errors.Is(err, errAssetJSON) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, io.EOF) ||
 			errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) ||
-			errors.As(err, &network)) {
+			errors.As(err, &network) || errors.As(err, &wgetExit)) {
 			break
 		}
 	}
@@ -357,6 +375,9 @@ func fetchRule(ctx context.Context, apiURL, browserURL, rawURL string, limit int
 }
 
 func fetchRuleOnce(ctx context.Context, url string, api bool, limit int64) ([]byte, error) {
+	if os.Getenv("DAED_GEODATA_WGET") == "1" {
+		return fetchRuleWget(ctx, url, api, limit)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -377,4 +398,38 @@ func fetchRuleOnce(ctx context.Context, url string, api bool, limit int64) ([]by
 		return nil, errAssetJSON
 	}
 	return io.ReadAll(io.LimitReader(response.Body, limit+1))
+}
+
+// The Docker image installs GNU wget, which validates HTTPS certificates.
+func fetchRuleWget(ctx context.Context, address string, api bool, limit int64) ([]byte, error) {
+	args := []string{"--quiet", "--tries=1", "--output-document=-"}
+	if api {
+		args = append(args, "--header=Accept: application/octet-stream", "--header=X-GitHub-Api-Version: 2022-11-28")
+	}
+	cmd := exec.CommandContext(ctx, "wget", append(args, "--", address)...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	body, readErr := io.ReadAll(io.LimitReader(stdout, limit+1))
+	if readErr != nil || int64(len(body)) > limit {
+		_ = cmd.Process.Kill()
+	}
+	waitErr := cmd.Wait()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	if int64(len(body)) > limit {
+		return body, nil
+	}
+	if waitErr != nil {
+		return nil, fmt.Errorf("wget: %w", waitErr)
+	}
+	return body, nil
 }
