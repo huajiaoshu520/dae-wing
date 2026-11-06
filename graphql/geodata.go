@@ -10,7 +10,14 @@ func (*MutationResolver) UpdateGeodata() (bool, error) {
 	return err == nil, err
 }
 
-func (*MutationResolver) SetGeodataDaily(args struct{ Enabled bool }) (bool, error) {
-	err := geodata.Default.SetDaily(args.Enabled)
+func (*MutationResolver) SetGeodataDaily(args struct {
+	Enabled bool
+	At      *string
+}) (bool, error) {
+	at := ""
+	if args.At != nil {
+		at = *args.At
+	}
+	err := geodata.Default.SetDaily(args.Enabled, at)
 	return err == nil, err
 }
